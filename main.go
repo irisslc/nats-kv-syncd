@@ -106,11 +106,72 @@ func saveMeta(metaKV nats.KeyValue, key string, m Meta) {
 	}
 }
 
+func publishOp(nc *nats.Conn, subj string, op Operation) {
+	b, err := json.Marshal(op)
+	if err != nil {
+		log.Printf("op marshal (%s/%s): %v", op.Bucket, op.Key, err)
+		return
+	}
+	if err := nc.Publish(subj, b); err != nil {
+		log.Printf("publish op (%s/%s): %v", op.Bucket, op.Key, err)
+	}
+}
+
+// Punto 7: "anti-entropy" mínima (reconciliación basada en estado al arrancar/reconectar).
+func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, nc *nats.Conn, repSubj, bucket, fallbackNodeID string) {
+	// 1) Publicar PUTs para todas las claves existentes en KV.
+	keys, err := kv.Keys()
+	if err == nil {
+		for _, k := range keys {
+			e, err := kv.Get(k)
+			if err != nil {
+				continue
+			}
+
+			m, ok := loadMeta(metaKV, k)
+			if !ok || m.TS == 0 {
+				m = Meta{TS: e.Created().Unix(), NodeID: fallbackNodeID, Deleted: false}
+				saveMeta(metaKV, k, m)
+			}
+
+			if m.Deleted {
+				publishOp(nc, repSubj, Operation{Op: "delete", Bucket: bucket, Key: k, TS: m.TS, NodeID: m.NodeID})
+				continue
+			}
+
+			publishOp(nc, repSubj, Operation{
+				Op:     "put",
+				Bucket: bucket,
+				Key:    k,
+				Value:  string(e.Value()),
+				TS:     m.TS,
+				NodeID: m.NodeID,
+			})
+		}
+	}
+
+	// 2) Publicar tombstones (DELETES) que existan solo en metaKV.
+	metaKeys, err := metaKV.Keys()
+	if err == nil {
+		for _, k := range metaKeys {
+			m, ok := loadMeta(metaKV, k)
+			if !ok || !m.Deleted {
+				continue
+			}
+			publishOp(nc, repSubj, Operation{Op: "delete", Bucket: bucket, Key: k, TS: m.TS, NodeID: m.NodeID})
+		}
+	}
+}
+
 func main() {
 	natsURL := flag.String("nats-url", "nats://localhost:4222", "NATS URL")
 	bucket := flag.String("bucket", "config", "KV bucket")
 	nodeID := flag.String("node-id", "", "Node ID")
 	repSubj := flag.String("rep-subj", "rep.kv.ops", "Replication subject")
+
+	announceOnStart := flag.Bool("announce-on-start", true, "P7: publicar estado local al arrancar")
+	announceOnReconnect := flag.Bool("announce-on-reconnect", true, "P7: publicar estado local tras reconectar a NATS")
+
 	flag.Parse()
 
 	if *nodeID == "" {
@@ -120,10 +181,29 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	nc, err := nats.Connect(*natsURL)
+	// Para el handler de reconexión necesitamos que KV/metaKV ya existan.
+	var (
+		kv     nats.KeyValue
+		metaKV nats.KeyValue
+		nc     *nats.Conn
+	)
+	ready := make(chan struct{})
+
+	conn, err := nats.Connect(*natsURL, nats.ReconnectHandler(func(_ *nats.Conn) {
+		if !*announceOnReconnect {
+			return
+		}
+		select {
+		case <-ready:
+			announceLocalState(kv, metaKV, nc, *repSubj, *bucket, *nodeID)
+		default:
+			// aún no inicializado
+		}
+	}))
 	if err != nil {
 		log.Fatalf("nats.Connect: %v", err)
 	}
+	nc = conn
 	defer nc.Drain()
 
 	js, err := nc.JetStream()
@@ -131,16 +211,18 @@ func main() {
 		log.Fatalf("JetStream: %v", err)
 	}
 
-	kv, err := getOrCreateKV(js, *bucket)
+	kv, err = getOrCreateKV(js, *bucket)
 	if err != nil {
 		log.Fatalf("KeyValue(%s): %v", *bucket, err)
 	}
 
 	metaBucket := *bucket + "_meta"
-	metaKV, err := getOrCreateKV(js, metaBucket)
+	metaKV, err = getOrCreateKV(js, metaBucket)
 	if err != nil {
 		log.Fatalf("KeyValue(%s): %v", metaBucket, err)
 	}
+
+	close(ready)
 
 	sup := newSuppressor()
 
@@ -210,14 +292,17 @@ func main() {
 		if e == nil {
 			break
 		}
-		// Opcional (pero útil): si no hay meta aún para una clave existente, inicialízala con el "Created" local.
-		// Esto está dentro del punto 6 (almacenamiento de metadatos) y ayuda en el primer arranque.
 		if _, ok := loadMeta(metaKV, e.Key()); !ok {
-			saveMeta(metaKV, e.Key(), Meta{TS: e.Created().Unix(), NodeID: "", Deleted: e.Operation() != nats.KeyValuePut})
+			saveMeta(metaKV, e.Key(), Meta{TS: e.Created().Unix(), NodeID: *nodeID, Deleted: e.Operation() != nats.KeyValuePut})
 		}
 	}
 
 	log.Printf("[%s] syncd activo: bucket=%s meta=%s subj=%s url=%s", *nodeID, *bucket, metaBucket, *repSubj, *natsURL)
+
+	// Punto 7: al arrancar, anunciamos el estado (anti-entropy) para converger tras una partición.
+	if *announceOnStart {
+		announceLocalState(kv, metaKV, nc, *repSubj, *bucket, *nodeID)
+	}
 
 	for {
 		select {
@@ -246,12 +331,8 @@ func main() {
 				}
 				saveMeta(metaKV, op.Key, Meta{TS: op.TS, NodeID: op.NodeID, Deleted: false})
 
-				b, _ := json.Marshal(op)
-				if err := nc.Publish(*repSubj, b); err != nil {
-					log.Printf("[%s] publish put %s: %v", *nodeID, op.Key, err)
-				} else {
-					log.Printf("[%s] publicado local: put %s (ts=%d)", *nodeID, op.Key, op.TS)
-				}
+				publishOp(nc, *repSubj, op)
+				log.Printf("[%s] publicado local: put %s (ts=%d)", *nodeID, op.Key, op.TS)
 
 			case nats.KeyValueDelete, nats.KeyValuePurge:
 				op := Operation{
@@ -263,15 +344,11 @@ func main() {
 				}
 				saveMeta(metaKV, op.Key, Meta{TS: op.TS, NodeID: op.NodeID, Deleted: true})
 
-				b, _ := json.Marshal(op)
-				if err := nc.Publish(*repSubj, b); err != nil {
-					log.Printf("[%s] publish delete %s: %v", *nodeID, op.Key, err)
-				} else {
-					log.Printf("[%s] publicado local: delete %s (ts=%d)", *nodeID, op.Key, op.TS)
-				}
+				publishOp(nc, *repSubj, op)
+				log.Printf("[%s] publicado local: delete %s (ts=%d)", *nodeID, op.Key, op.TS)
 
 			default:
-				// Ignore other internal ops (e.g. initialization markers)
+				// Ignore other internal ops
 			}
 		}
 	}
