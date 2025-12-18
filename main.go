@@ -262,12 +262,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	nc, err := nats.Connect(*natsURL, nats.ReconnectHandler(func(_ *nats.Conn) {
-		if *announceOnReconnect {
-			// la reconciliación usa JS; la llamamos desde el loop principal donde tenemos js/kv/meta/clock.
-			// aquí solo dejamos el hook para mantener compatibilidad, pero la acción se dispara por ticker/arranque.
-		}
-	}))
+	reconCh := make(chan struct{}, 1)
+
+nc, err := nats.Connect(*natsURL, nats.ReconnectHandler(func(_ *nats.Conn) {
+	// Punto 9.3: además del replay (consumer durable), forzamos una reconciliación
+	// basada en estado cuando vuelve la conectividad.
+	if !*announceOnReconnect {
+		return
+	}
+	select {
+	case reconCh <- struct{}{}:
+	default:
+	}
+}))
 	if err != nil {
 		log.Fatalf("nats.Connect: %v", err)
 	}
@@ -408,6 +415,18 @@ func main() {
 		announceLocalState(kv, metaKV, js, *repSubj, *bucket, *nodeID, &clock)
 	}
 
+
+	// Punto 9.3: reconciliación al reconectar (complementa el replay del consumer durable).
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reconCh:
+				announceLocalState(kv, metaKV, js, *repSubj, *bucket, *nodeID, &clock)
+			}
+		}
+	}()
 	// P9.4: reconcile periódico
 	if *reconcileEvery > 0 {
 		t := time.NewTicker(*reconcileEvery)
