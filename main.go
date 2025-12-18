@@ -106,21 +106,7 @@ func saveMeta(metaKV nats.KeyValue, key string, m Meta) {
 	}
 }
 
-func publishOp(nc *nats.Conn, subj string, op Operation) {
-	b, err := json.Marshal(op)
-	if err != nil {
-		log.Printf("op marshal (%s/%s): %v", op.Bucket, op.Key, err)
-		return
-	}
-	if err := nc.Publish(subj, b); err != nil {
-		log.Printf("publish op (%s/%s): %v", op.Bucket, op.Key, err)
-	}
-}
-
-// -------------------- Punto 8 (Desafíos) --------------------
-// Requerido: "Usar reloj lógico o contador por nodo."
-// Implementamos un reloj lógico Lamport persistido en un bucket KV paralelo (<bucket>_clock),
-// para que los timestamps sean monotónicos y no dependan del reloj físico.
+// -------------------- Punto 8: reloj lógico Lamport --------------------
 type Lamport struct {
 	mu  sync.Mutex
 	val int64
@@ -148,7 +134,6 @@ func (l *Lamport) persist() {
 	}
 }
 
-// Tick genera un nuevo timestamp local (evento local).
 func (l *Lamport) Tick() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -157,14 +142,12 @@ func (l *Lamport) Tick() int64 {
 	return l.val
 }
 
-// Observe actualiza el reloj al recibir una operación remota.
 func (l *Lamport) Observe(remoteTS int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if remoteTS > l.val {
 		l.val = remoteTS
 	}
-	// recibir cuenta como evento
 	l.val++
 	l.persist()
 }
@@ -175,9 +158,37 @@ func (l *Lamport) Value() int64 {
 	return l.val
 }
 
-// -------------------- Punto 7: anti-entropy mínima --------------------
-func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, nc *nats.Conn, repSubj, bucket, fallbackNodeID string, clock *Lamport) {
-	// 1) Publicar PUTs para todas las claves existentes en KV.
+// -------------------- Punto 9: JetStream duradero para rep.kv.ops --------------------
+func ensureRepStream(js nats.JetStreamContext, streamName, subj string) error {
+	if _, err := js.StreamInfo(streamName); err == nil {
+		return nil
+	} else if !errors.Is(err, nats.ErrStreamNotFound) {
+		return err
+	}
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      streamName,
+		Subjects:  []string{subj},
+		Storage:   nats.FileStorage, // persistente (dentro del servidor)
+		Retention: nats.LimitsPolicy,
+		MaxAge:    7 * 24 * time.Hour, // ajustable
+	})
+	return err
+}
+
+func jsPublishOp(js nats.JetStreamContext, subj string, op Operation) {
+	b, err := json.Marshal(op)
+	if err != nil {
+		log.Printf("op marshal (%s/%s): %v", op.Bucket, op.Key, err)
+		return
+	}
+	if _, err := js.Publish(subj, b); err != nil {
+		log.Printf("js.Publish op (%s/%s): %v", op.Bucket, op.Key, err)
+	}
+}
+
+// -------------------- Punto 7: anti-entropy mínima (estado) --------------------
+func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, js nats.JetStreamContext, repSubj, bucket, fallbackNodeID string, clock *Lamport) {
 	keys, err := kv.Keys()
 	if err == nil {
 		for _, k := range keys {
@@ -193,11 +204,11 @@ func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, nc *nats.Conn, r
 			}
 
 			if m.Deleted {
-				publishOp(nc, repSubj, Operation{Op: "delete", Bucket: bucket, Key: k, TS: m.TS, NodeID: m.NodeID})
+				jsPublishOp(js, repSubj, Operation{Op: "delete", Bucket: bucket, Key: k, TS: m.TS, NodeID: m.NodeID})
 				continue
 			}
 
-			publishOp(nc, repSubj, Operation{
+			jsPublishOp(js, repSubj, Operation{
 				Op:     "put",
 				Bucket: bucket,
 				Key:    k,
@@ -208,7 +219,6 @@ func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, nc *nats.Conn, r
 		}
 	}
 
-	// 2) Publicar tombstones (DELETES) que existan solo en metaKV.
 	metaKeys, err := metaKV.Keys()
 	if err == nil {
 		for _, k := range metaKeys {
@@ -216,12 +226,10 @@ func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, nc *nats.Conn, r
 			if !ok || !m.Deleted {
 				continue
 			}
-			publishOp(nc, repSubj, Operation{Op: "delete", Bucket: bucket, Key: k, TS: m.TS, NodeID: m.NodeID})
+			jsPublishOp(js, repSubj, Operation{Op: "delete", Bucket: bucket, Key: k, TS: m.TS, NodeID: m.NodeID})
 		}
 	}
 }
-
-// -------------------- main --------------------
 
 func main() {
 	natsURL := flag.String("nats-url", "nats://localhost:4222", "NATS URL")
@@ -229,42 +237,40 @@ func main() {
 	nodeID := flag.String("node-id", "", "Node ID")
 	repSubj := flag.String("rep-subj", "rep.kv.ops", "Replication subject")
 
-	announceOnStart := flag.Bool("announce-on-start", true, "P7: publicar estado local al arrancar")
-	announceOnReconnect := flag.Bool("announce-on-reconnect", true, "P7: publicar estado local tras reconectar a NATS")
+	// P7/P9: reconciliación por estado
+	announceOnStart := flag.Bool("announce-on-start", true, "Publicar estado local al arrancar")
+	announceOnReconnect := flag.Bool("announce-on-reconnect", true, "Publicar estado local tras reconectar a NATS")
+
+	// P9.4 (adicional): reconciliación periódica. 0 = desactivado.
+	reconcileEvery := flag.Duration("reconcile-every", 5*time.Minute, "P9: ejecutar reconcile periódicamente; 0 para desactivar")
+
+	// P9.1: stream + consumer durable
+	repStream := flag.String("rep-stream", "REPKVOPS", "P9: nombre del stream JetStream para rep-subj")
+	durable := flag.String("durable", "", "P9: durable consumer (por defecto syncd-<node-id>)")
+	fetchBatch := flag.Int("fetch-batch", 64, "P9: batch size para PullSubscribe/Fetch")
+	fetchWait := flag.Duration("fetch-wait", 500*time.Millisecond, "P9: MaxWait por Fetch")
 
 	flag.Parse()
 
 	if *nodeID == "" {
 		log.Fatal("Falta --node-id")
 	}
+	if *durable == "" {
+		*durable = "syncd-" + *nodeID
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Para el handler de reconexión necesitamos que KV/metaKV/clock estén inicializados.
-	var (
-		kv      nats.KeyValue
-		metaKV  nats.KeyValue
-		clockKV nats.KeyValue
-		clock   Lamport
-		nc      *nats.Conn
-	)
-	ready := make(chan struct{})
-
-	conn, err := nats.Connect(*natsURL, nats.ReconnectHandler(func(_ *nats.Conn) {
-		if !*announceOnReconnect {
-			return
-		}
-		select {
-		case <-ready:
-			announceLocalState(kv, metaKV, nc, *repSubj, *bucket, *nodeID, &clock)
-		default:
+	nc, err := nats.Connect(*natsURL, nats.ReconnectHandler(func(_ *nats.Conn) {
+		if *announceOnReconnect {
+			// la reconciliación usa JS; la llamamos desde el loop principal donde tenemos js/kv/meta/clock.
+			// aquí solo dejamos el hook para mantener compatibilidad, pero la acción se dispara por ticker/arranque.
 		}
 	}))
 	if err != nil {
 		log.Fatalf("nats.Connect: %v", err)
 	}
-	nc = conn
 	defer nc.Drain()
 
 	js, err := nc.JetStream()
@@ -272,93 +278,116 @@ func main() {
 		log.Fatalf("JetStream: %v", err)
 	}
 
-	kv, err = getOrCreateKV(js, *bucket)
+	kv, err := getOrCreateKV(js, *bucket)
 	if err != nil {
 		log.Fatalf("KeyValue(%s): %v", *bucket, err)
 	}
-
 	metaBucket := *bucket + "_meta"
-	metaKV, err = getOrCreateKV(js, metaBucket)
+	metaKV, err := getOrCreateKV(js, metaBucket)
 	if err != nil {
 		log.Fatalf("KeyValue(%s): %v", metaBucket, err)
 	}
 
-	// Punto 8: bucket de reloj lógico
 	clockBucket := *bucket + "_clock"
-	clockKV, err = getOrCreateKV(js, clockBucket)
+	clockKV, err := getOrCreateKV(js, clockBucket)
 	if err != nil {
 		log.Fatalf("KeyValue(%s): %v", clockBucket, err)
 	}
-	clock = Lamport{val: loadLamport(clockKV), kv: clockKV}
+	clock := Lamport{val: loadLamport(clockKV), kv: clockKV}
 
-	close(ready)
+	// P9.1: stream persistente para rep.kv.ops
+	if err := ensureRepStream(js, *repStream, *repSubj); err != nil {
+		log.Fatalf("ensureRepStream(%s): %v", *repStream, err)
+	}
+
+	// P9.1: consumidor durable (Pull)
+	sub, err := js.PullSubscribe(*repSubj, *durable,
+		nats.BindStream(*repStream),
+		nats.ManualAck(),
+	)
+	if err != nil {
+		log.Fatalf("PullSubscribe(%s, durable=%s): %v", *repSubj, *durable, err)
+	}
 
 	sup := newSuppressor()
 
-	// 6.2 · Recibir operaciones remotas
-	_, err = nc.Subscribe(*repSubj, func(m *nats.Msg) {
-		var op Operation
-		if err := json.Unmarshal(m.Data, &op); err != nil {
-			log.Printf("[%s] op JSON inválido: %v", *nodeID, err)
-			return
-		}
-		if op.Bucket != *bucket {
-			return
-		}
-		if op.NodeID == *nodeID {
-			return // ignorar eco local
-		}
-
-		// Punto 8: avanzar reloj lógico al recibir (aunque luego no gane).
-		clock.Observe(op.TS)
-
-		localMeta, ok := loadMeta(metaKV, op.Key)
-		if !ok {
-			localMeta = Meta{}
-		}
-		remoteMeta := Meta{TS: op.TS, NodeID: op.NodeID, Deleted: op.Op == "delete"}
-
-		if !remoteWins(remoteMeta, localMeta) {
-			return
-		}
-
-		// Evitar que el watcher publique de nuevo el cambio que vamos a aplicar.
-		sup.add(op.Key, 2*time.Second)
-
-		switch op.Op {
-		case "put":
-			if _, err := kv.Put(op.Key, []byte(op.Value)); err != nil {
-				log.Printf("[%s] aplicar put remoto %s: %v", *nodeID, op.Key, err)
-				return
+	// Consumidor durable: JetStream entregará pendientes tras reconectar.
+	go func() {
+		for ctx.Err() == nil {
+			msgs, err := sub.Fetch(*fetchBatch, nats.MaxWait(*fetchWait))
+			if err != nil {
+				if errors.Is(err, nats.ErrTimeout) {
+					continue
+				}
+				log.Printf("[%s] fetch err: %v", *nodeID, err)
+				continue
 			}
-			saveMeta(metaKV, op.Key, remoteMeta)
-			log.Printf("[%s] aplicado remoto: put %s (ts=%d node=%s)", *nodeID, op.Key, op.TS, op.NodeID)
+			for _, m := range msgs {
+				func() {
+					defer func() { _ = m.Ack() }()
 
-		case "delete":
-			if err := kv.Delete(op.Key); err != nil {
-				log.Printf("[%s] aplicar delete remoto %s: %v", *nodeID, op.Key, err)
-				return
+					var op Operation
+					if err := json.Unmarshal(m.Data, &op); err != nil {
+						log.Printf("[%s] op JSON inválido: %v", *nodeID, err)
+						return
+					}
+					if op.Bucket != *bucket {
+						return
+					}
+
+					// P8: avanzar reloj al recibir
+					clock.Observe(op.TS)
+
+					// Ignorar eco local, pero ACK igualmente
+					if op.NodeID == *nodeID {
+						return
+					}
+
+					localMeta, ok := loadMeta(metaKV, op.Key)
+					if !ok {
+						localMeta = Meta{}
+					}
+					remoteMeta := Meta{TS: op.TS, NodeID: op.NodeID, Deleted: op.Op == "delete"}
+
+					if !remoteWins(remoteMeta, localMeta) {
+						return
+					}
+
+					sup.add(op.Key, 2*time.Second)
+
+					switch op.Op {
+					case "put":
+						if _, err := kv.Put(op.Key, []byte(op.Value)); err != nil {
+							log.Printf("[%s] aplicar put remoto %s: %v", *nodeID, op.Key, err)
+							return
+						}
+						saveMeta(metaKV, op.Key, remoteMeta)
+						log.Printf("[%s] aplicado remoto: put %s (ts=%d node=%s)", *nodeID, op.Key, op.TS, op.NodeID)
+
+					case "delete":
+						if err := kv.Delete(op.Key); err != nil {
+							log.Printf("[%s] aplicar delete remoto %s: %v", *nodeID, op.Key, err)
+							return
+						}
+						saveMeta(metaKV, op.Key, remoteMeta)
+						log.Printf("[%s] aplicado remoto: delete %s (ts=%d node=%s)", *nodeID, op.Key, op.TS, op.NodeID)
+
+					default:
+						log.Printf("[%s] op desconocida: %q", *nodeID, op.Op)
+					}
+				}()
 			}
-			saveMeta(metaKV, op.Key, remoteMeta)
-			log.Printf("[%s] aplicado remoto: delete %s (ts=%d node=%s)", *nodeID, op.Key, op.TS, op.NodeID)
-
-		default:
-			log.Printf("[%s] op desconocida: %q", *nodeID, op.Op)
-			return
 		}
-	})
-	if err != nil {
-		log.Fatalf("Subscribe(%s): %v", *repSubj, err)
-	}
+	}()
 
-	// 6.1 · Vigilar cambios locales
+	// Watch local
 	w, err := kv.WatchAll()
 	if err != nil {
 		log.Fatalf("WatchAll: %v", err)
 	}
 	defer w.Stop()
 
-	// Drenar el estado inicial para no republicarlo como "cambio local".
+	// Drain initial
 	for {
 		e := <-w.Updates()
 		if e == nil {
@@ -371,14 +400,31 @@ func main() {
 		}
 	}
 
-	log.Printf("[%s] syncd activo: bucket=%s meta=%s clock=%s subj=%s url=%s (clock=%d)",
-		*nodeID, *bucket, metaBucket, clockBucket, *repSubj, *natsURL, clock.Value())
+	log.Printf("[%s] syncd activo: bucket=%s meta=%s clock=%s rep-stream=%s durable=%s subj=%s url=%s (clock=%d)",
+		*nodeID, *bucket, metaBucket, clockBucket, *repStream, *durable, *repSubj, *natsURL, clock.Value())
 
-	// Punto 7: al arrancar, anunciamos el estado (anti-entropy).
+	// P7/P9: announce al arrancar
 	if *announceOnStart {
-		announceLocalState(kv, metaKV, nc, *repSubj, *bucket, *nodeID, &clock)
+		announceLocalState(kv, metaKV, js, *repSubj, *bucket, *nodeID, &clock)
 	}
 
+	// P9.4: reconcile periódico
+	if *reconcileEvery > 0 {
+		t := time.NewTicker(*reconcileEvery)
+		defer t.Stop()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					announceLocalState(kv, metaKV, js, *repSubj, *bucket, *nodeID, &clock)
+				}
+			}
+		}()
+	}
+
+	// Main loop: publicar operaciones locales como mensajes duraderos
 	for {
 		select {
 		case <-ctx.Done():
@@ -405,8 +451,7 @@ func main() {
 					NodeID: *nodeID,
 				}
 				saveMeta(metaKV, op.Key, Meta{TS: op.TS, NodeID: op.NodeID, Deleted: false})
-
-				publishOp(nc, *repSubj, op)
+				jsPublishOp(js, *repSubj, op)
 				log.Printf("[%s] publicado local: put %s (ts=%d)", *nodeID, op.Key, op.TS)
 
 			case nats.KeyValueDelete, nats.KeyValuePurge:
@@ -418,12 +463,11 @@ func main() {
 					NodeID: *nodeID,
 				}
 				saveMeta(metaKV, op.Key, Meta{TS: op.TS, NodeID: op.NodeID, Deleted: true})
-
-				publishOp(nc, *repSubj, op)
+				jsPublishOp(js, *repSubj, op)
 				log.Printf("[%s] publicado local: delete %s (ts=%d)", *nodeID, op.Key, op.TS)
 
 			default:
-				// Ignore other internal ops
+				// Ignore
 			}
 		}
 	}
