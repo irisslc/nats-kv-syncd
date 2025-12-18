@@ -1,12 +1,14 @@
 services:
   nats-a:
     image: nats:latest
+    container_name: nats-a
     command: ["-js"]
     ports:
       - "4222:4222"
 
   nats-b:
     image: nats:latest
+    container_name: nats-b
     command: ["-js"]
     ports:
       - "5222:4222"
