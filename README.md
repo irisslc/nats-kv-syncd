@@ -1,8 +1,10 @@
-# nats-kv-syncd — Sincronización KV NATS con CRDT (LWW) + JetStream + Leaf Nodes
+# Sincronización KV NATS con CRDT (LWW) + JetStream + Leaf Nodes
 
-Este repositorio implementa el agente **nats-kv-syncd**, que mantiene consistentes varios buckets KV de NATS (uno por sitio) usando un CRDT **LWW-Register** con soporte de **borrados (tombstones)**, **reloj lógico (Lamport)**, **recuperación ante mensajes perdidos (JetStream durable)** y **fusión periódica (anti-entropy)**. fileciteturn11file5 fileciteturn11file2
+### Autores: Iris Maria Lorente Cutanda, Anass Lambaraa Ben Razzouq
 
-La topología final usa **leaf nodes** para que NATS enrute el subject de replicación entre sitios (desafío adicional 2). fileciteturn11file1
+Este repositorio implementa el agente **nats-kv-syncd**, que mantiene consistentes varios buckets KV de NATS (uno por sitio) usando un CRDT **LWW-Register** con soporte de **borrados (tombstones)**, **reloj lógico (Lamport)**, **recuperación ante mensajes perdidos (JetStream durable)** y **fusión periódica (anti-entropy)**.
+
+La topología final usa **leaf nodes** para que NATS enrute el subject de replicación entre sitios (desafío adicional 2).
 
 ---
 
@@ -36,7 +38,7 @@ Topología:
 - `nats-a` y `nats-b`: servidores NATS **locales** (JetStream + KV) y conectan al hub como **leaf nodes**.
 - El agente en cada sitio se conecta a su NATS local y replica operaciones por `rep.kv.ops`.
 
-Esto permite que `rep.kv.ops` se enrute entre sitios por NATS (leaf nodes), sin que el agente “sepa” de la topología (solo publica/consume el subject). fileciteturn11file1
+Esto permite que `rep.kv.ops` se enrute entre sitios por NATS (leaf nodes), sin que el agente “sepa” de la topología (solo publica/consume el subject). 
 
 ---
 
@@ -76,7 +78,7 @@ GOTOOLCHAIN=go1.23.0+auto go run .   --nats-url nats://localhost:5222   --bucket
 ## 5) Explicación de la lógica CRDT (LWW Register)
 
 ### 5.1 Operaciones
-El agente replica operaciones en JSON sobre `rep.kv.ops` con el formato: `{op, bucket, key, value?, ts, node_id}`. fileciteturn11file0 fileciteturn11file11
+El agente replica operaciones en JSON sobre `rep.kv.ops` con el formato: `{op, bucket, key, value?, ts, node_id}`. 
 
 - `op="put"`: asigna valor a una clave.
 - `op="delete"`: borra (lógico) una clave.
@@ -87,10 +89,10 @@ Para cada clave se guarda el meta `(ts, node_id, deleted)` y al recibir una oper
 - `(ts_remoto > ts_local)` o
 - `(ts_remoto == ts_local AND node_id_remoto > node_id_local)`
 
-En caso contrario se conserva el valor local. fileciteturn11file0
+En caso contrario se conserva el valor local.
 
 ### 5.3 Deletes seguros (tombstones)
-Un `delete` crea/actualiza un meta con `deleted=true` (tombstone), evitando resurrecciones por `put` antiguos tras una partición. fileciteturn11file2
+Un `delete` crea/actualiza un meta con `deleted=true` (tombstone), evitando resurrecciones por `put` antiguos tras una partición. 
 
 ---
 
@@ -100,9 +102,9 @@ Un `delete` crea/actualiza un meta con `deleted=true` (tombstone), evitando resu
 ```json
 {"ts": 12, "node_id":"site-a", "deleted": false}
 ```
-Persistimos ahí lo necesario para el merge LWW + tombstones. fileciteturn11file11
+Persistimos ahí lo necesario para el merge LWW + tombstones. 
 
-- Bucket `config_clock` (o `<bucket>_clock`) para el contador Lamport persistido (punto 8). fileciteturn11file2
+- Bucket `config_clock` (o `<bucket>_clock`) para el contador Lamport persistido (punto 8). 
 
 ---
 
@@ -112,27 +114,27 @@ Persistimos ahí lo necesario para el merge LWW + tombstones. fileciteturn
 Se usa `kv.WatchAll()` y, ante PUT/DELETE:
 1) genera `ts` (Lamport),
 2) actualiza `config_meta`,
-3) publica operación en `rep.kv.ops`. fileciteturn11file0
+3) publica operación en `rep.kv.ops`.
 
 Se drena el “estado inicial” del watcher para no republicar todo como cambios nuevos.
 
 ### 7.2 Punto 6.3 — Realizar el merge
-Se lee meta local en `config_meta`, se compara con meta remoto usando la regla LWW del documento y se aplica `kv.Put`/`kv.Delete` si gana remoto; luego se persiste el meta ganador. fileciteturn11file0
+Se lee meta local en `config_meta`, se compara con meta remoto usando la regla LWW del documento y se aplica `kv.Put`/`kv.Delete` si gana remoto; luego se persiste el meta ganador. 
 
 ### 7.3 Punto 9.1 — Reproducción de operaciones (JetStream durable)
-**Cómo:** stream para `rep.kv.ops` (p. ej. `REPKVOPS`) + consumer durable pull con ACK explícito; publicación con `js.Publish(...)`. fileciteturn11file2
+**Cómo:** stream para `rep.kv.ops` (p. ej. `REPKVOPS`) + consumer durable pull con ACK explícito; publicación con `js.Publish(...)`. 
 
 **✅ Ventaja:** replay de pendientes al reconectar.  
 **⚠️ Inconveniente:** backlog/retención (coste si se queda atrás).
 
 ### 7.4 Punto 9.2 — Reconciliación basada en estado
-**Cómo:** al reconectar o periódicamente, listar keys/metas y re-publicar PUT/DELETE equivalentes para forzar convergencia. fileciteturn11file2
+**Cómo:** al reconectar o periódicamente, listar keys/metas y re-publicar PUT/DELETE equivalentes para forzar convergencia.
 
 **✅ Ventaja:** repara divergencias aunque falten operaciones.  
 **⚠️ Inconveniente:** más coste (listado/estado completo).
 
 ### 7.5 Punto 9.3 — Estrategia híbrida
-**Cómo:** JetStream durable + reconcile periódico/al reconectar. fileciteturn11file2  
+**Cómo:** JetStream durable + reconcile periódico/al reconectar.
 **✅ Ventaja:** robustez alta.  
 **⚠️ Inconveniente:** más complejidad y tráfico.
 
@@ -141,32 +143,32 @@ Se publica en `rep.kv.ops`:
 ```bash
 nats --server localhost:4222 pub rep.kv.ops '{"op":"put","bucket":"config","key":"app/theme","value":"dark","ts":12,"node_id":"site-a"}'
 ```
-fileciteturn11file11
+
 
 ---
 
 ## 8) Cuestiones de autoevaluación (punto 11)
 
 1. **¿Por qué los CRDT no necesitan consenso global?**  
-Porque convergen por merge determinista y propiedades conmutativa/asociativa/idempotente; no hace falta un orden global único. fileciteturn11file1 fileciteturn11file9
+Porque convergen por merge determinista y propiedades conmutativa/asociativa/idempotente; no hace falta un orden global único.
 
 2. **¿Qué ventaja aporta usar `node_id` como desempate?**  
 Determinismo cuando `ts` empata: todas las réplicas eligen el mismo ganador.
 
 3. **¿Qué ocurre si dos sitios tienen relojes desincronizados?**  
-Con tiempo físico, el “ganador” puede ser incorrecto; por eso se usa reloj lógico/contador (Lamport) como exige el punto 8. fileciteturn11file2
+Con tiempo físico, el “ganador” puede ser incorrecto; por eso se usa reloj lógico/contador (Lamport) como exige el punto 8.
 
 4. **¿Diferencia entre replicación por operaciones y por estado?**  
-Operaciones: envías “lo que pasó”. Estado: envías “cómo estoy” y haces merge. fileciteturn11file2
+Operaciones: envías “lo que pasó”. Estado: envías “cómo estoy” y haces merge.
 
 5. **¿Qué garantiza la idempotencia en una actualización CRDT?**  
-Que re-aplicar/reintentar no altera el resultado final, haciendo seguros duplicados/replays. fileciteturn11file1 fileciteturn11file9
+Que re-aplicar/reintentar no altera el resultado final, haciendo seguros duplicados/replays.
 
 6. **¿Por qué combinar JetStream con reconciliación periódica?**  
-JetStream cubre pérdidas con replay; la reconciliación corrige divergencias si faltan operaciones o hubo cambios fuera del flujo. fileciteturn11file2
+JetStream cubre pérdidas con replay; la reconciliación corrige divergencias si faltan operaciones o hubo cambios fuera del flujo. 
 
 7. **¿Qué pruebas harías para demostrar convergencia tras una partición?**  
-Desconectar hub/leaf o un sitio, hacer escrituras concurrentes y reconectar verificando convergencia según LWW (incluyendo deletes). fileciteturn11file11
+Desconectar hub/leaf o un sitio, hacer escrituras concurrentes y reconectar verificando convergencia según LWW (incluyendo deletes). 
 
 8. **¿Diferencias con cr-sqlite?**  
 Aquí el CRDT es LWW por clave + mensajería NATS/JetStream; cr-sqlite integra CRDTs en el motor de datos a nivel BD con semánticas más ricas.
@@ -180,7 +182,7 @@ Aquí el CRDT es LWW por clave + mensajería NATS/JetStream; cr-sqlite integra C
 - Lamport: `ts` monotónico y persistido.
 - JetStream durable: `Unprocessed Messages: 0` tras replay.
 - Híbrida: reconcile corrige cambios “fuera de banda”.
-- Leaf nodes: escritura en `nats-a` se refleja en `nats-b`. fileciteturn11file1 fileciteturn11file2
+- Leaf nodes: escritura en `nats-a` se refleja en `nats-b`. 
 
 ---
 
