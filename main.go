@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -89,7 +90,6 @@ func loadMeta(metaKV nats.KeyValue, key string) (Meta, bool) {
 	}
 	var m Meta
 	if err := json.Unmarshal(e.Value(), &m); err != nil {
-		// Si el JSON está corrupto, actuamos como si no hubiese meta.
 		return Meta{}, false
 	}
 	return m, true
@@ -117,8 +117,66 @@ func publishOp(nc *nats.Conn, subj string, op Operation) {
 	}
 }
 
-// Punto 7: "anti-entropy" mínima (reconciliación basada en estado al arrancar/reconectar).
-func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, nc *nats.Conn, repSubj, bucket, fallbackNodeID string) {
+// -------------------- Punto 8 (Desafíos) --------------------
+// Requerido: "Usar reloj lógico o contador por nodo."
+// Implementamos un reloj lógico Lamport persistido en un bucket KV paralelo (<bucket>_clock),
+// para que los timestamps sean monotónicos y no dependan del reloj físico.
+type Lamport struct {
+	mu  sync.Mutex
+	val int64
+	kv  nats.KeyValue
+}
+
+func loadLamport(clockKV nats.KeyValue) int64 {
+	e, err := clockKV.Get("clock")
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.ParseInt(string(e.Value()), 10, 64)
+	if err != nil || v < 0 {
+		return 0
+	}
+	return v
+}
+
+func (l *Lamport) persist() {
+	if l.kv == nil {
+		return
+	}
+	if _, err := l.kv.Put("clock", []byte(strconv.FormatInt(l.val, 10))); err != nil {
+		log.Printf("clock put: %v", err)
+	}
+}
+
+// Tick genera un nuevo timestamp local (evento local).
+func (l *Lamport) Tick() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.val++
+	l.persist()
+	return l.val
+}
+
+// Observe actualiza el reloj al recibir una operación remota.
+func (l *Lamport) Observe(remoteTS int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if remoteTS > l.val {
+		l.val = remoteTS
+	}
+	// recibir cuenta como evento
+	l.val++
+	l.persist()
+}
+
+func (l *Lamport) Value() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.val
+}
+
+// -------------------- Punto 7: anti-entropy mínima --------------------
+func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, nc *nats.Conn, repSubj, bucket, fallbackNodeID string, clock *Lamport) {
 	// 1) Publicar PUTs para todas las claves existentes en KV.
 	keys, err := kv.Keys()
 	if err == nil {
@@ -130,7 +188,7 @@ func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, nc *nats.Conn, r
 
 			m, ok := loadMeta(metaKV, k)
 			if !ok || m.TS == 0 {
-				m = Meta{TS: e.Created().Unix(), NodeID: fallbackNodeID, Deleted: false}
+				m = Meta{TS: clock.Tick(), NodeID: fallbackNodeID, Deleted: false}
 				saveMeta(metaKV, k, m)
 			}
 
@@ -163,6 +221,8 @@ func announceLocalState(kv nats.KeyValue, metaKV nats.KeyValue, nc *nats.Conn, r
 	}
 }
 
+// -------------------- main --------------------
+
 func main() {
 	natsURL := flag.String("nats-url", "nats://localhost:4222", "NATS URL")
 	bucket := flag.String("bucket", "config", "KV bucket")
@@ -181,11 +241,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Para el handler de reconexión necesitamos que KV/metaKV ya existan.
+	// Para el handler de reconexión necesitamos que KV/metaKV/clock estén inicializados.
 	var (
-		kv     nats.KeyValue
-		metaKV nats.KeyValue
-		nc     *nats.Conn
+		kv      nats.KeyValue
+		metaKV  nats.KeyValue
+		clockKV nats.KeyValue
+		clock   Lamport
+		nc      *nats.Conn
 	)
 	ready := make(chan struct{})
 
@@ -195,9 +257,8 @@ func main() {
 		}
 		select {
 		case <-ready:
-			announceLocalState(kv, metaKV, nc, *repSubj, *bucket, *nodeID)
+			announceLocalState(kv, metaKV, nc, *repSubj, *bucket, *nodeID, &clock)
 		default:
-			// aún no inicializado
 		}
 	}))
 	if err != nil {
@@ -222,6 +283,14 @@ func main() {
 		log.Fatalf("KeyValue(%s): %v", metaBucket, err)
 	}
 
+	// Punto 8: bucket de reloj lógico
+	clockBucket := *bucket + "_clock"
+	clockKV, err = getOrCreateKV(js, clockBucket)
+	if err != nil {
+		log.Fatalf("KeyValue(%s): %v", clockBucket, err)
+	}
+	clock = Lamport{val: loadLamport(clockKV), kv: clockKV}
+
 	close(ready)
 
 	sup := newSuppressor()
@@ -239,6 +308,9 @@ func main() {
 		if op.NodeID == *nodeID {
 			return // ignorar eco local
 		}
+
+		// Punto 8: avanzar reloj lógico al recibir (aunque luego no gane).
+		clock.Observe(op.TS)
 
 		localMeta, ok := loadMeta(metaKV, op.Key)
 		if !ok {
@@ -293,15 +365,18 @@ func main() {
 			break
 		}
 		if _, ok := loadMeta(metaKV, e.Key()); !ok {
-			saveMeta(metaKV, e.Key(), Meta{TS: e.Created().Unix(), NodeID: *nodeID, Deleted: e.Operation() != nats.KeyValuePut})
+			isDel := e.Operation() != nats.KeyValuePut
+			ts := clock.Tick()
+			saveMeta(metaKV, e.Key(), Meta{TS: ts, NodeID: *nodeID, Deleted: isDel})
 		}
 	}
 
-	log.Printf("[%s] syncd activo: bucket=%s meta=%s subj=%s url=%s", *nodeID, *bucket, metaBucket, *repSubj, *natsURL)
+	log.Printf("[%s] syncd activo: bucket=%s meta=%s clock=%s subj=%s url=%s (clock=%d)",
+		*nodeID, *bucket, metaBucket, clockBucket, *repSubj, *natsURL, clock.Value())
 
-	// Punto 7: al arrancar, anunciamos el estado (anti-entropy) para converger tras una partición.
+	// Punto 7: al arrancar, anunciamos el estado (anti-entropy).
 	if *announceOnStart {
-		announceLocalState(kv, metaKV, nc, *repSubj, *bucket, *nodeID)
+		announceLocalState(kv, metaKV, nc, *repSubj, *bucket, *nodeID, &clock)
 	}
 
 	for {
@@ -317,7 +392,7 @@ func main() {
 				continue
 			}
 
-			now := time.Now().Unix()
+			ts := clock.Tick()
 
 			switch e.Operation() {
 			case nats.KeyValuePut:
@@ -326,7 +401,7 @@ func main() {
 					Bucket: *bucket,
 					Key:    e.Key(),
 					Value:  string(e.Value()),
-					TS:     now,
+					TS:     ts,
 					NodeID: *nodeID,
 				}
 				saveMeta(metaKV, op.Key, Meta{TS: op.TS, NodeID: op.NodeID, Deleted: false})
@@ -339,7 +414,7 @@ func main() {
 					Op:     "delete",
 					Bucket: *bucket,
 					Key:    e.Key(),
-					TS:     now,
+					TS:     ts,
 					NodeID: *nodeID,
 				}
 				saveMeta(metaKV, op.Key, Meta{TS: op.TS, NodeID: op.NodeID, Deleted: true})
