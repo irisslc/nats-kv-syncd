@@ -1,14 +1,38 @@
 services:
+  nats-hub:
+    image: nats:2.12.2
+    container_name: nats-hub
+    command: ["-c", "/etc/nats/nats-hub.conf"]
+    volumes:
+      - ./nats-hub.conf:/etc/nats/nats-hub.conf:ro
+      - ./data/hub:/data
+    ports:
+      - "6222:4222"
+      - "8422:8222"
+      - "7422:7422"
+
   nats-a:
-    image: nats:latest
+    image: nats:2.12.2
     container_name: nats-a
-    command: ["-js"]
+    command: ["-c", "/etc/nats/nats-a.conf"]
+    volumes:
+      - ./nats-a.conf:/etc/nats/nats-a.conf:ro
+      - ./data/a:/data
     ports:
       - "4222:4222"
+      - "8222:8222"
+    depends_on:
+      - nats-hub
 
   nats-b:
-    image: nats:latest
+    image: nats:2.12.2
     container_name: nats-b
-    command: ["-js"]
+    command: ["-c", "/etc/nats/nats-b.conf"]
+    volumes:
+      - ./nats-b.conf:/etc/nats/nats-b.conf:ro
+      - ./data/b:/data
     ports:
       - "5222:4222"
+      - "8223:8222"
+    depends_on:
+      - nats-hub
