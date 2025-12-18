@@ -135,6 +135,7 @@ Se lee meta local en `config_meta`, se compara con meta remoto usando la regla L
 
 ### 7.5 Punto 9.3 — Estrategia híbrida
 **Cómo:** JetStream durable + reconcile periódico/al reconectar.
+
 **✅ Ventaja:** robustez alta.  
 **⚠️ Inconveniente:** más complejidad y tráfico.
 
